@@ -21,7 +21,7 @@ using Windows.Storage.Streams;
 
 class Program
 {
-    static readonly string imagesToBeProcessed = @"D:\FilesToBeCracked";
+    static readonly string imagesToBeProcessed = @"D:\FilesToBeProcessed";
 
     // BIG "safe" capture region (tune these if needed)
     static readonly Rectangle CaptureRegion = new Rectangle(
@@ -164,7 +164,7 @@ class Program
             NewLine = "\n",
             Encoding = Encoding.ASCII
         };
-        arduino.Open();
+         arduino.Open();
     }
 
     static void CleanupSerial()
@@ -221,7 +221,7 @@ class Program
         CreateResponseOptions options = new();
 
         options.InputItems.Add(ResponseItem.CreateUserMessageItem(
-            "You are answering an accounting question from OCR text.\n\n" +
+            "You are answering a question from OCR text.\n\n" +
             "Output MUST be 32 characters or fewer.\n" +
             "Return ONLY the final answer. No explanation.\n\n" +
             "Rules:\n" +
