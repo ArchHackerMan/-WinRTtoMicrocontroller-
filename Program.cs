@@ -1,8 +1,10 @@
 ﻿using OpenAI;
+using OpenAI.Chat;
 using OpenAI.Responses;
 
 using System;
 using System.Collections.Generic;
+
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -65,22 +67,15 @@ class Program
                     // 1) Capture tiles (saved as PNG files)
                     var tilePaths = ScreenCaptureTiles(imagesToBeProcessed, CaptureRegion, TileCols, TileRows);
 
-                    // 2) OCR each tile and merge
-                    SendToArduino("OCR...");
-                    string ocrText = await Ocr.ReadTextFromTilesAsync(tilePaths);
 
-                    Console.WriteLine("----- OCR TEXT -----");
-                    Console.WriteLine(ocrText);
-                    Console.WriteLine("--------------------");
-
-                    // 3) Ask OpenAI
+                    // 2) Ask OpenAI
                     SendToArduino("PROCESSING...");
-                    string answer = await ContactOpenAI(ocrText);
+                    string answer = await ContactOpenAI(tilePaths);
 
-                    // 4) Enforce LCD limit hard
+                    // 3) Enforce LCD limit hard
                     answer = SanitizeTo32(answer);
 
-                    // 5) Display
+                    // 4) Display
                     SendToArduino(answer);
 
                     Console.WriteLine("AI:");
@@ -159,7 +154,7 @@ class Program
 
     static void InitializeSerial()
     {
-        arduino = new SerialPort("COM14", 9600)
+        arduino = new SerialPort("COM15", 9600)
         {
             NewLine = "\n",
             Encoding = Encoding.ASCII
@@ -212,16 +207,18 @@ class Program
 
     // ------------------- OpenAI -------------------
 
-#pragma warning disable OPENAI001
-    static async Task<string> ContactOpenAI(string ocrText)
+    static async Task<string> ContactOpenAI(List<string> imagePaths)
     {
         var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
-        ResponsesClient client = new(model: "gpt-5-mini", apiKey: apiKey);
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new InvalidOperationException("OPENAI_API_KEY is not set.");
 
-        CreateResponseOptions options = new();
+        ChatClient client = new(model: "gpt-4o", apiKey: apiKey);
 
-        options.InputItems.Add(ResponseItem.CreateUserMessageItem(
-            "You are answering a question from OCR text.\n\n" +
+        var parts = new List<ChatMessageContentPart>
+    {
+        ChatMessageContentPart.CreateTextPart(
+            "You are answering a question from one or more screenshot images.\n\n" +
             "Output MUST be 32 characters or fewer.\n" +
             "Return ONLY the final answer. No explanation.\n\n" +
             "Rules:\n" +
@@ -229,121 +226,35 @@ class Program
             "- If choices are unlabeled, return only the choice number (1,2,3...).\n" +
             "- If 'select all that apply', return letters or numbers separated by commas.\n" +
             "- If True/False, return only T or F.\n" +
-            "- If numeric, return only the number (and unit only if essential).\n" +
+            "- If numeric, return only the number.\n" +
             "- If fill-in, return the shortest correct phrase.\n" +
-            "- If OCR text is unclear, return UNSURE.\n\n" +
-            $"OCR:\n{ocrText}"
-        ));
+            "- If the images are unclear, return UNSURE.\n\n" +
+            "The screenshots may be split into vertical tiles. Treat them as parts of the same screen."
+        )
+    };
 
-        ResponseResult resp = await client.CreateResponseAsync(options);
+        foreach (string path in imagePaths)
+        {
+            byte[] bytes = await File.ReadAllBytesAsync(path);
+            BinaryData imageBytes = BinaryData.FromBytes(bytes);
+            parts.Add(ChatMessageContentPart.CreateImagePart(imageBytes, "image/png"));
+        }
 
-        string answer =
-            resp.OutputItems
-                .OfType<MessageResponseItem>()
-                .FirstOrDefault()?
-                .Content?
-                .FirstOrDefault()?
-                .Text ?? "";
+        List<ChatMessage> messages =
+        [
+            new UserChatMessage(parts.ToArray())
+        ];
 
+        ChatCompletion completion = await client.CompleteChatAsync(messages);
+
+        string answer = completion.Content.FirstOrDefault()?.Text ?? "";
         return SanitizeTo32(answer);
     }
-#pragma warning restore OPENAI001
 }
 
 // ------------------- Windows OCR (Tiles) -------------------
 
-public static class Ocr
-{
-    public static async Task<string> ReadTextFromTilesAsync(List<string> tilePaths)
-    {
-        var sb = new StringBuilder();
 
-        foreach (var path in tilePaths)
-        {
-            string t = await ReadTextFromPngAsync(path);
-
-            t = NormalizeOcr(t);
-
-            if (!string.IsNullOrWhiteSpace(t))
-            {
-                sb.AppendLine(t);
-                sb.AppendLine();
-            }
-        }
-
-        return sb.ToString().Trim();
-    }
-
-    public static async Task<string> ReadTextFromPngAsync(string imagePath)
-    {
-        if (!File.Exists(imagePath))
-            throw new FileNotFoundException("Image not found", imagePath);
-
-        var engine = OcrEngine.TryCreateFromUserProfileLanguages();
-        if (engine == null)
-            throw new InvalidOperationException("Windows OCR engine not available.");
-
-        using var fs = File.OpenRead(imagePath);
-        using IRandomAccessStream ras = fs.AsRandomAccessStream();
-
-        var decoder = await BitmapDecoder.CreateAsync(ras);
-
-        // decode native, then convert to Gray8 (avoids "unsupported pixel format")
-        using SoftwareBitmap sb = await decoder.GetSoftwareBitmapAsync();
-        SoftwareBitmap gray =
-            sb.BitmapPixelFormat == BitmapPixelFormat.Gray8
-                ? sb
-                : SoftwareBitmap.Convert(sb, BitmapPixelFormat.Gray8);
-
-        try
-        {
-            var result = await engine.RecognizeAsync(gray);
-
-            // Use Lines to preserve line breaks better than result.Text
-            var outSb = new StringBuilder();
-            foreach (var line in result.Lines)
-                outSb.AppendLine(line.Text);
-
-            return outSb.ToString();
-        }
-        finally
-        {
-            if (!ReferenceEquals(gray, sb))
-                gray.Dispose();
-        }
-    }
-
-    static string NormalizeOcr(string text)
-    {
-        text = text.Replace("\r\n", "\n").Replace("\r", "\n");
-
-        // Trim lines + drop empty lines
-        var lines = text
-            .Split('\n')
-            .Select(l => l.Trim())
-            .Where(l => !string.IsNullOrWhiteSpace(l))
-            .ToList();
-
-        // Collapse excessive internal spaces per line
-        for (int i = 0; i < lines.Count; i++)
-        {
-            string s = lines[i];
-            while (s.Contains("  "))
-                s = s.Replace("  ", " ");
-            lines[i] = s;
-        }
-
-        // Optional: remove immediate duplicate consecutive lines (helps with tile overlap noise)
-        var dedup = new List<string>();
-        foreach (var line in lines)
-        {
-            if (dedup.Count == 0 || !string.Equals(dedup[^1], line, StringComparison.OrdinalIgnoreCase))
-                dedup.Add(line);
-        }
-
-        return string.Join("\n", dedup);
-    }
-}
 
 // ------------------- Global Hotkey (suppressed '\') -------------------
 // This intercepts '\' globally and prevents it from typing anywhere.
