@@ -3,7 +3,7 @@
     "CrackingTool": {
       "commandName": "Project",
       "environmentVariables": {
-        "OPENAI_API_KEY": "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"
+        "OPENAI_API_KEY": "Place API key here"
       }
     }
   }
