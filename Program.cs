@@ -39,8 +39,14 @@ class Program
 
     static SerialPort arduino;
     static readonly object serialLock = new object();
+    static readonly object displayLock = new object();
 
     static readonly SemaphoreSlim pipelineGate = new SemaphoreSlim(1, 1);
+
+    // Full answer storage for scrolling
+    static string fullDisplayText = "READY";
+    static int scrollIndex = 0;
+    const int DisplayWindowSize = 32; // 16x2 LCD
 
     [STAThread]
     static void Main()
@@ -48,55 +54,64 @@ class Program
         Directory.CreateDirectory(imagesToBeProcessed);
 
         InitializeSerial();
-        SendToArduino("READY");
+        SetDisplayText("READY");
+        SendCurrentWindowToArduino();
 
         AppDomain.CurrentDomain.ProcessExit += (_, __) => CleanupSerial();
         Console.CancelKeyPress += (_, e) => { CleanupSerial(); e.Cancel = false; };
 
-        Application.Run(new HotkeyForm(() =>
-        {
-            _ = Task.Run(async () =>
+        Application.Run(new HotkeyForm(
+            onCaptureHotkey: () =>
             {
-                if (!await pipelineGate.WaitAsync(0))
-                    return;
-
-                try
+                _ = Task.Run(async () =>
                 {
-                    SendToArduino("CAPTURING...");
+                    if (!await pipelineGate.WaitAsync(0))
+                        return;
 
-                    // 1) Capture tiles (saved as PNG files)
-                    var tilePaths = ScreenCaptureTiles(imagesToBeProcessed, CaptureRegion, TileCols, TileRows);
+                    try
+                    {
+                        SendImmediateToArduino("CAPTURING...");
 
+                        // 1) Capture tiles (saved as PNG files)
+                        var tilePaths = ScreenCaptureTiles(imagesToBeProcessed, CaptureRegion, TileCols, TileRows);
 
-                    // 2) Ask OpenAI
-                    SendToArduino("PROCESSING...");
-                    string answer = await ContactOpenAI(tilePaths);
+                        // 2) Ask OpenAI
+                        SendImmediateToArduino("PROCESSING...");
+                        string answer = await ContactOpenAI(tilePaths);
 
-                    // 3) Enforce LCD limit hard
-                    answer = SanitizeTo32(answer);
+                        // 3) Store full answer for scrolling
+                        SetDisplayText(answer);
 
-                    // 4) Display
-                    SendToArduino(answer);
+                        // 4) Display current 32-char window
+                        SendCurrentWindowToArduino();
 
-                    Console.WriteLine("AI:");
-                    Console.WriteLine(answer);
+                        Console.WriteLine("AI:");
+                        Console.WriteLine(answer);
 
-                    // Optional: delete tiles after each run (keeps folder clean)
-                    SafeDeleteFiles(tilePaths);
-
-                    
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine(ex);
-                    SendToArduino("ERROR");
-                }
-                finally
-                {
-                    pipelineGate.Release();
-                }
-            });
-        }));
+                        // Optional: delete tiles after each run (keeps folder clean)
+                        SafeDeleteFiles(tilePaths);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex);
+                        SendImmediateToArduino("ERROR");
+                    }
+                    finally
+                    {
+                        pipelineGate.Release();
+                    }
+                });
+            },
+            onScrollLeftHotkey: () =>
+            {
+                if (ScrollLeft())
+                    SendCurrentWindowToArduino();
+            },
+            onScrollRightHotkey: () =>
+            {
+                if (ScrollRight())
+                    SendCurrentWindowToArduino();
+            }));
     }
 
     // ------------------- Capture (Tiles) -------------------
@@ -159,7 +174,7 @@ class Program
             NewLine = "\n",
             Encoding = Encoding.ASCII
         };
-         arduino.Open();
+        arduino.Open();
     }
 
     static void CleanupSerial()
@@ -178,17 +193,33 @@ class Program
         }
     }
 
-    static void SendToArduino(string msg)
+    static void SendImmediateToArduino(string msg)
+    {
+        WriteWindowToArduino(BuildWindowFromText(SanitizeForDisplayStorage(msg), 0));
+    }
+
+    static void SendCurrentWindowToArduino()
+    {
+        string window;
+        lock (displayLock)
+        {
+            window = BuildWindowFromText(fullDisplayText, scrollIndex);
+        }
+
+        WriteWindowToArduino(window);
+    }
+
+    static void WriteWindowToArduino(string msg32)
     {
         lock (serialLock)
         {
             if (arduino == null || !arduino.IsOpen)
                 return;
 
-            msg = SanitizeTo32(msg);
+            msg32 = msg32 ?? "".PadRight(DisplayWindowSize);
 
-            string line1 = msg.Length > 16 ? msg.Substring(0, 16) : msg.PadRight(16);
-            string line2 = msg.Length > 16 ? msg.Substring(16).PadRight(16) : new string(' ', 16);
+            string line1 = msg32.Length >= 16 ? msg32.Substring(0, 16) : msg32.PadRight(16);
+            string line2 = msg32.Length > 16 ? msg32.Substring(16, Math.Min(16, msg32.Length - 16)).PadRight(16) : new string(' ', 16);
 
             arduino.WriteLine("CLR");
             arduino.WriteLine(line1);
@@ -196,12 +227,73 @@ class Program
         }
     }
 
-    static string SanitizeTo32(string s)
+    static void SetDisplayText(string s)
+    {
+        lock (displayLock)
+        {
+            fullDisplayText = SanitizeForDisplayStorage(s);
+            scrollIndex = 0;
+        }
+    }
+
+    static bool ScrollLeft()
+    {
+        lock (displayLock)
+        {
+            if (scrollIndex <= 0)
+                return false;
+
+            scrollIndex -= DisplayWindowSize;
+
+            if (scrollIndex < 0)
+                scrollIndex = 0;
+
+            return true;
+        }
+    }
+
+    static bool ScrollRight()
+    {
+        lock (displayLock)
+        {
+            if (fullDisplayText.Length <= DisplayWindowSize)
+                return false;
+
+            int maxIndex = fullDisplayText.Length - DisplayWindowSize;
+
+            if (scrollIndex >= maxIndex)
+                return false;
+
+            scrollIndex += DisplayWindowSize;
+
+            if (scrollIndex > maxIndex)
+                scrollIndex = maxIndex;
+
+            return true;
+        }
+    }
+
+    static string BuildWindowFromText(string s, int index)
+    {
+        s = SanitizeForDisplayStorage(s);
+
+        if (s.Length <= DisplayWindowSize)
+            return s.PadRight(DisplayWindowSize);
+
+        if (index < 0) index = 0;
+        if (index > s.Length - DisplayWindowSize) index = s.Length - DisplayWindowSize;
+
+        return s.Substring(index, DisplayWindowSize);
+    }
+
+    static string SanitizeForDisplayStorage(string s)
     {
         s = (s ?? "").Trim().Replace("\r", "").Replace("\n", " ");
         while (s.Contains("  ")) s = s.Replace("  ", " ");
-        if (s.Length > 32) s = s.Substring(0, 32);
-        if (s.Length == 0) s = "UNSURE";
+
+        if (s.Length == 0)
+            s = "UNSURE";
+
         return s;
     }
 
@@ -216,22 +308,40 @@ class Program
         ChatClient client = new(model: "gpt-4o", apiKey: apiKey);
 
         var parts = new List<ChatMessageContentPart>
-    {
-        ChatMessageContentPart.CreateTextPart(
-            "You are answering a question from one or more screenshot images.\n\n" +
-            "Output MUST be 32 characters or fewer.\n" +
-            "Return ONLY the final answer. No explanation.\n\n" +
-            "Rules:\n" +
-            "- If multiple choice with letters, return only the letter.\n" +
-            "- If choices are unlabeled, return only the choice number (1,2,3...).\n" +
-            "- If 'select all that apply', return letters or numbers separated by commas.\n" +
-            "- If True/False, return only T or F.\n" +
-            "- If numeric, return only the number.\n" +
-            "- If fill-in, return the shortest correct phrase.\n" +
-            "- If the images are unclear, return UNSURE.\n\n" +
-            "The screenshots may be split into vertical tiles. Treat them as parts of the same screen."
-        )
-    };
+        {
+            ChatMessageContentPart.CreateTextPart(
+               "You are answering a question from one or more screenshot images.\n\n" +
+
+    "Read the question carefully and determine whether it requires only a final answer or requires explanation/work.\n\n" +
+
+    "General Rules:\n" +
+    "1. If the question is multiple choice with letters, return only the letter UNLESS the question asks for explanation, reasoning, why, or how.\n" +
+    "2. If choices are unlabeled, return only the choice number unless explanation is requested.\n" +
+    "3. If 'select all that apply', return letters or numbers separated by commas unless explanation is requested.\n" +
+    "4. If True/False, return only T or F unless explanation is requested.\n" +
+    "5. If the question asks WHY, EXPLAIN, DESCRIBE, or HOW, you MUST show the reasoning.\n" +
+    "6. If explanation is required, give a clear but concise explanation (1–2 sentences or compact steps).\n" +
+    "7. Do NOT include unnecessary filler or long paragraphs.\n" +
+    "8. If the images are unclear, return UNSURE.\n\n" +
+
+    "Accounting-Specific Rules:\n" +
+    "If the question involves accounting, journal entries, T-accounts, or transactions AND asks for explanation or why:\n\n" +
+
+    "- Identify what happened in the transaction.\n" +
+    "- Identify the accounts affected.\n" +
+    "- State which accounts are debited and credited.\n" +
+    "- Briefly explain WHY each account is debited or credited (increase/decrease logic).\n" +
+    "- Keep the explanation compact using short phrases or semicolon-separated steps.\n\n" +
+
+    "Example format:\n" +
+    "\"Cash received; Cash increases (debit); Revenue increases (credit)\"\n\n" +
+    "OR\n\n" +
+    "\"Supplies purchased; Supplies increases (debit); Cash decreases (credit)\"\n\n" +
+
+    "Keep accounting explanations short but complete enough to show reasoning.\n\n" +
+
+    "The screenshots may be split into vertical tiles. Treat them as parts of the same screen.")
+        };
 
         foreach (string path in imagePaths)
         {
@@ -248,27 +358,26 @@ class Program
         ChatCompletion completion = await client.CompleteChatAsync(messages);
 
         string answer = completion.Content.FirstOrDefault()?.Text ?? "";
-        return SanitizeTo32(answer);
+        return SanitizeForDisplayStorage(answer);
     }
 }
 
-// ------------------- Windows OCR (Tiles) -------------------
-
-
-
-// ------------------- Global Hotkey (suppressed '\') -------------------
-// This intercepts '\' globally and prevents it from typing anywhere.
+// ------------------- Global Hotkey (suppressed '\', '[', ']') -------------------
 
 class HotkeyForm : Form
 {
-    private readonly Action _onHotkey;
+    private readonly Action _onCaptureHotkey;
+    private readonly Action _onScrollLeftHotkey;
+    private readonly Action _onScrollRightHotkey;
 
     private IntPtr _hookId = IntPtr.Zero;
     private LowLevelKeyboardProc _proc;
 
-    public HotkeyForm(Action onHotkey)
+    public HotkeyForm(Action onCaptureHotkey, Action onScrollLeftHotkey, Action onScrollRightHotkey)
     {
-        _onHotkey = onHotkey;
+        _onCaptureHotkey = onCaptureHotkey;
+        _onScrollLeftHotkey = onScrollLeftHotkey;
+        _onScrollRightHotkey = onScrollRightHotkey;
 
         ShowInTaskbar = false;
         WindowState = FormWindowState.Minimized;
@@ -295,8 +404,14 @@ class HotkeyForm : Form
     private const int WM_KEYDOWN = 0x0100;
     private const int WM_SYSKEYDOWN = 0x0104;
 
-    // Backslash key (\) / pipe (|) key on US layout
+    // \ key
     private const int VK_OEM_5 = 0xDC;
+
+    // [ key
+    private const int VK_OEM_4 = 0xDB;
+
+    // ] key
+    private const int VK_OEM_6 = 0xDD;
 
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -325,10 +440,19 @@ class HotkeyForm : Form
 
             if (info.vkCode == VK_OEM_5)
             {
-                // Don't run heavy work on the hook thread; enqueue onto UI thread
-                BeginInvoke(new Action(() => _onHotkey()));
+                BeginInvoke(new Action(() => _onCaptureHotkey()));
+                return (IntPtr)1;
+            }
 
-                // Suppress the key so nothing receives '\'
+            if (info.vkCode == VK_OEM_4)
+            {
+                BeginInvoke(new Action(() => _onScrollLeftHotkey()));
+                return (IntPtr)1;
+            }
+
+            if (info.vkCode == VK_OEM_6)
+            {
+                BeginInvoke(new Action(() => _onScrollRightHotkey()));
                 return (IntPtr)1;
             }
         }
