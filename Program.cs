@@ -48,6 +48,8 @@ class Program
     static int scrollIndex = 0;
     const int DisplayWindowSize = 32; // 16x2 LCD
 
+    string prompt = "";
+
     [STAThread]
     static void Main()
     {
@@ -309,38 +311,7 @@ class Program
 
         var parts = new List<ChatMessageContentPart>
         {
-            ChatMessageContentPart.CreateTextPart(
-               "You are answering a question from one or more screenshot images.\n\n" +
-
-    "Read the question carefully and determine whether it requires only a final answer or requires explanation/work.\n\n" +
-
-    "General Rules:\n" +
-    "1. If the question is multiple choice with letters, return only the letter UNLESS the question asks for explanation, reasoning, why, or how.\n" +
-    "2. If choices are unlabeled, return only the choice number unless explanation is requested.\n" +
-    "3. If 'select all that apply', return letters or numbers separated by commas unless explanation is requested.\n" +
-    "4. If True/False, return only T or F unless explanation is requested.\n" +
-    "5. If the question asks WHY, EXPLAIN, DESCRIBE, or HOW, you MUST show the reasoning.\n" +
-    "6. If explanation is required, give a clear but concise explanation (1–2 sentences or compact steps).\n" +
-    "7. Do NOT include unnecessary filler or long paragraphs.\n" +
-    "8. If the images are unclear, return UNSURE.\n\n" +
-
-    "Accounting-Specific Rules:\n" +
-    "If the question involves accounting, journal entries, T-accounts, or transactions AND asks for explanation or why:\n\n" +
-
-    "- Identify what happened in the transaction.\n" +
-    "- Identify the accounts affected.\n" +
-    "- State which accounts are debited and credited.\n" +
-    "- Briefly explain WHY each account is debited or credited (increase/decrease logic).\n" +
-    "- Keep the explanation compact using short phrases or semicolon-separated steps.\n\n" +
-
-    "Example format:\n" +
-    "\"Cash received; Cash increases (debit); Revenue increases (credit)\"\n\n" +
-    "OR\n\n" +
-    "\"Supplies purchased; Supplies increases (debit); Cash decreases (credit)\"\n\n" +
-
-    "Keep accounting explanations short but complete enough to show reasoning.\n\n" +
-
-    "The screenshots may be split into vertical tiles. Treat them as parts of the same screen.")
+            ChatMessageContentPart.CreateTextPart(prompt)
         };
 
         foreach (string path in imagePaths)
